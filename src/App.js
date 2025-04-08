@@ -1,6 +1,3 @@
-/* === FRONTEND: React.js (Next.js) === */
-// Install dependencies: npm install next react react-dom axios
-
 import { useState } from "react";
 import axios from "axios";
 import "./App.css";
@@ -46,7 +43,7 @@ function App() {
 
   return (
     <div className="container">
-      <h1 className="title">AI router configurer</h1>
+      <h1 className="title">Router Configuration AI</h1>
       <div className="upload-section">
         <input type="file" onChange={handleFileChange} accept="application/pdf" className="file-input" />
         <button onClick={uploadFile} className="button">Upload PDF</button>
