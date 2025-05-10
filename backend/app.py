@@ -1,103 +1,135 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from langdetect import detect
 import os
-from PyPDF2 import PdfReader
-from sentence_transformers import SentenceTransformer, util
 import torch
+import re
+import fitz  # PyMuPDF
+import requests
+from transformers import AutoTokenizer, AutoModel
 
-# Initialisation de l'application Flask
+# Variable globale
+pdf_lang = "en"
+
 app = Flask(__name__)
 CORS(app)
 
-# Dossier pour stocker les PDF uploadés
 UPLOAD_FOLDER = "uploaded_files"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-# Chargement du modèle d'encodage sémantique
-model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+# === Modèle léger pour embeddings ===
+MODEL_NAME = "sentence-transformers/paraphrase-MiniLM-L6-v2"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModel.from_pretrained(MODEL_NAME)
 
-# Variables globales
 extracted_text = ""
-pdf_sentences = []
+pdf_sections = []
 pdf_embeddings = None
 
-# Extraction du texte depuis le PDF
-def extract_text_from_pdf(filepath):
+# Lecture optimisée du texte PDF
+def extract_text_from_pdf(filepath, max_pages=None):
     try:
-        reader = PdfReader(filepath)
-        return "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
+        doc = fitz.open(filepath)
+        pages = doc[:max_pages] if max_pages else doc
+        return "\n".join(page.get_text("text") for page in pages if page.get_text("text"))
     except Exception as e:
-        print(f"Erreur lors de la lecture du PDF : {e}")
+        print(f"Erreur lecture PDF : {e}")
         return ""
 
-# Route pour l'upload du fichier
+# Divise le texte par blocs de 800 caractères (au lieu de titres)
+def split_text_into_chunks(text, chunk_size=800):
+    text = re.sub(r"\s+", " ", text)
+    return [text[i:i+chunk_size].strip() for i in range(0, len(text), chunk_size) if len(text[i:i+chunk_size].strip()) > 50]
+
+def clean_question(text):
+    return text.strip()
+
+def mean_pooling(model_output, attention_mask):
+    token_embeddings = model_output[0]
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size())
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+def encode(texts):
+    if isinstance(texts, str):
+        texts = [texts]
+    inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+    with torch.no_grad():
+        outputs = model(**inputs)
+    return mean_pooling(outputs, inputs['attention_mask'])
+
+def call_llama3(prompt):
+    response = requests.post(
+        "http://localhost:11434/api/generate",
+        json={"model": "llama3", "prompt": prompt, "stream": False}
+    )
+    return response.json().get("response", "No response generated.").strip()
+
 @app.route("/upload", methods=["POST"])
 def upload_pdf():
-    global extracted_text, pdf_sentences, pdf_embeddings
+    global extracted_text, pdf_sections, pdf_embeddings, pdf_lang
 
     if 'pdf' not in request.files:
-        return jsonify({"message": "Aucun fichier PDF reçu."}), 400
+        return jsonify({"message": "No PDF file received."}), 400
 
     file = request.files['pdf']
     if file.filename == '':
-        return jsonify({"message": "Nom de fichier invalide."}), 400
+        return jsonify({"message": "Invalid filename."}), 400
 
     filepath = os.path.join(app.config["UPLOAD_FOLDER"], file.filename)
     file.save(filepath)
 
     extracted_text = extract_text_from_pdf(filepath)
     if not extracted_text.strip():
-        return jsonify({"message": "PDF lu mais aucun texte trouvé."}), 400
+        return jsonify({"message": "PDF is empty or unreadable."}), 400
 
-    # Découper le texte en phrases (simple split)
-    pdf_sentences = [s.strip() for s in extracted_text.split(".") if s.strip()]
-    pdf_embeddings = model.encode(pdf_sentences, convert_to_tensor=True)
+    try:
+        pdf_lang = detect(extracted_text[:1000])
+    except Exception:
+        pdf_lang = "en"  # fallback
 
-    return jsonify({"message": "✅ PDF analysé avec succès 🔍"})
+    pdf_sections = split_text_into_chunks(extracted_text)
+    if not pdf_sections:
+        return jsonify({"message": "No useful content found in PDF."}), 400
 
-# Route pour poser une question
+    pdf_embeddings = encode(pdf_sections)
+    return jsonify({"message": "✅ PDF successfully analyzed."})
+
 @app.route("/ask", methods=["POST"])
 def ask_question():
-    global pdf_embeddings, pdf_sentences
+    global pdf_embeddings, pdf_sections, pdf_lang
 
     data = request.get_json()
     question = data.get("question", "").strip()
-
     if not question:
-        return jsonify({"answer": "❌ Aucune question fournie."}), 400
+        return jsonify({"answer": "❌ No question provided."}), 400
 
-    if pdf_embeddings is None or len(pdf_sentences) == 0 or pdf_embeddings.size(0) == 0:
-        return jsonify({"answer": "❗ Aucun PDF n’a encore été traité."})
+    if pdf_embeddings is None or len(pdf_sections) == 0:
+        return jsonify({"answer": "❗ No document has been processed yet."}), 400
 
-    question_embedding = model.encode(question, convert_to_tensor=True)
-    scores = util.cos_sim(question_embedding, pdf_embeddings)[0]
+    question_embedding = encode(f"query: {question}")[0]
+    scores = torch.nn.functional.cosine_similarity(pdf_embeddings, question_embedding.unsqueeze(0)).squeeze()
 
-    # Seuil minimum de similarité
+    best_idx = torch.argmax(scores).item()
+    best_score = scores[best_idx].item()
     threshold = 0.4
 
-    # Filtrage des phrases utiles (ignorer les titres/généralités)
-    top_results = []
-    for i, score in enumerate(scores):
-        text = pdf_sentences[i].strip()
-        if score.item() > threshold and len(text.split()) > 5 and not text.lower().startswith(("guide", "introduction", "#")):
-            top_results.append((i, score.item()))
+    if best_score < threshold:
+        return jsonify({"answer": "No relevant answer found in the document."})
 
-    if not top_results:
-        return jsonify({"answer": "🤔 Je ne trouve pas de réponse claire dans le PDF."})
+    context = pdf_sections[best_idx]
 
-    # Top 3 résultats triés par pertinence
-    top_results = sorted(top_results, key=lambda x: x[1], reverse=True)[:3]
-    answer_parts = [f"- {pdf_sentences[i].strip()}." for i, _ in top_results]
-    final_answer = "\n".join(answer_parts)
+    if pdf_lang.startswith("fr"):
+        prompt = f"### CONTEXTE :\n{context}\n\n### QUESTION :\n{question}\n\n### RÉPONSE EN FRANÇAIS :"
+    else:
+        prompt = f"### CONTEXT:\n{context}\n\n### QUESTION:\n{question}\n\n### ANSWER IN ENGLISH:"
 
-    return jsonify({"answer": final_answer})
+    answer = call_llama3(prompt)
+    return jsonify({"answer": answer})
 
-# Route de test de l'API
 @app.route("/test", methods=["GET"])
-def test_route():
-    return jsonify({'message': '✅ API opérationnelle avec intelligence sémantique 🧠'})
+def test():
+    return jsonify({"message": "✅ API running with lightweight PDF processing."})
 
-# Lancement de l'application
 if __name__ == '__main__':
     app.run(debug=True, host="0.0.0.0", port=5000)
